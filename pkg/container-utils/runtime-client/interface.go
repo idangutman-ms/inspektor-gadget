@@ -50,6 +50,15 @@ type ContainerExtendedData struct {
 
 	// List of mounts in the container.
 	Mounts []ContainerMountData
+
+	// Unique identifier of pod running the container.
+	PodUID string
+
+	// Name of the pod running the container.
+	PodName string
+
+	// Namespace of the pod running the container.
+	PodNamespace string
 }
 
 // ContainerMountData contains mount information in ContainerExtendedData.

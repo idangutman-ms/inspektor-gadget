@@ -40,6 +40,12 @@ type CRIClient struct {
 	client pb.RuntimeServiceClient
 }
 
+const (
+	containerLabelK8sPodName      = "io.kubernetes.pod.name"
+	containerLabelK8sPodNamespace = "io.kubernetes.pod.namespace"
+	containerLabelK8sPodUID       = "io.kubernetes.pod.uid"
+)
+
 func NewCRIClient(name, socketPath string, timeout time.Duration) (CRIClient, error) {
 	conn, err := grpc.Dial(
 		socketPath,
@@ -170,6 +176,17 @@ func parseContainerExtendedData(runtimeName string, containerStatus *pb.Containe
 			State:   containerStatusStateToRuntimeClientState(containerStatus.State),
 			Runtime: runtimeName,
 		},
+	}
+
+	// Fill K8S information.
+	if podName, ok := containerStatus.Labels[containerLabelK8sPodName]; ok {
+		containerExtendedData.PodName = podName
+	}
+	if podNamespace, ok := containerStatus.Labels[containerLabelK8sPodNamespace]; ok {
+		containerExtendedData.PodNamespace = podNamespace
+	}
+	if podUID, ok := containerStatus.Labels[containerLabelK8sPodUID]; ok {
+		containerExtendedData.PodUID = podUID
 	}
 
 	// Parse the extra info and fill the extended data.
