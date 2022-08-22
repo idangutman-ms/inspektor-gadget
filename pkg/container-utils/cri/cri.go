@@ -24,7 +24,6 @@ import (
 	"time"
 
 	runtimeclient "github.com/kinvolk/inspektor-gadget/pkg/container-utils/runtime-client"
-	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
@@ -68,16 +67,6 @@ func NewCRIClient(name, socketPath string, timeout time.Duration) (CRIClient, er
 	}, nil
 }
 
-func (c *CRIClient) PidFromContainerID(containerID string) (int, error) {
-	// Get the container extended data (containing the PID)
-	containerExtendedData, err := c.GetContainerExtended(containerID)
-	if err != nil {
-		return -1, err
-	}
-
-	return containerExtendedData.Pid, nil
-}
-
 func listContainers(c *CRIClient, filter *pb.ContainerFilter) ([]*pb.Container, error) {
 	request := &pb.ListContainersRequest{}
 	if filter != nil {
@@ -109,25 +98,6 @@ func (c *CRIClient) GetContainers() ([]*runtimeclient.ContainerData, error) {
 }
 
 func (c *CRIClient) GetContainer(containerID string) (*runtimeclient.ContainerData, error) {
-	containers, err := listContainers(c, &pb.ContainerFilter{
-		Id: containerID,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	if len(containers) == 0 {
-		return nil, fmt.Errorf("container %q not found", containerID)
-	}
-	if len(containers) > 1 {
-		log.Warnf("CRIClient: multiple containers (%d) with ID %q. Taking the first one: %+v",
-			len(containers), containerID, containers)
-	}
-
-	return CRIContainerToContainerData(c.Name, containers[0]), nil
-}
-
-func (c *CRIClient) GetContainerExtended(containerID string) (*runtimeclient.ContainerExtendedData, error) {
 	containerID, err := runtimeclient.ParseContainerID(c.Name, containerID)
 	if err != nil {
 		return nil, err
@@ -143,7 +113,7 @@ func (c *CRIClient) GetContainerExtended(containerID string) (*runtimeclient.Con
 		return nil, err
 	}
 
-	return parseContainerExtendedData(c.Name, res.Status, res.Info)
+	return parseContainerData(c.Name, res.Status, res.Info)
 }
 
 func (c *CRIClient) Close() error {
@@ -163,39 +133,38 @@ func CRIContainerToContainerData(runtimeName string, container *pb.Container) *r
 	}
 }
 
-// parseContainerExtendedData parses the container status and extra information
+// parseContainerData parses the container status and extra information
 // returned by ContainerStatus() into a ContainerExtraInfo structure.
-func parseContainerExtendedData(runtimeName string, containerStatus *pb.ContainerStatus,
+func parseContainerData(runtimeName string, containerStatus *pb.ContainerStatus,
 	extraInfo map[string]string,
-) (*runtimeclient.ContainerExtendedData, error) {
+) (*runtimeclient.ContainerData, error) {
 	// Create container extra info structure to be filled.
-	containerExtendedData := runtimeclient.ContainerExtendedData{
-		ContainerData: runtimeclient.ContainerData{
-			ID:      containerStatus.Id,
-			Name:    strings.TrimPrefix(containerStatus.GetMetadata().Name, "/"),
-			State:   containerStatusStateToRuntimeClientState(containerStatus.State),
-			Runtime: runtimeName,
-		},
+	containerData := runtimeclient.ContainerData{
+		ID:      containerStatus.Id,
+		Name:    strings.TrimPrefix(containerStatus.GetMetadata().Name, "/"),
+		State:   containerStatusStateToRuntimeClientState(containerStatus.State),
+		Runtime: runtimeName,
 	}
 
 	// Fill K8S information.
 	if podName, ok := containerStatus.Labels[containerLabelK8sPodName]; ok {
-		containerExtendedData.PodName = podName
+		containerData.PodName = podName
 	}
 	if podNamespace, ok := containerStatus.Labels[containerLabelK8sPodNamespace]; ok {
-		containerExtendedData.PodNamespace = podNamespace
+		containerData.PodNamespace = podNamespace
 	}
 	if podUID, ok := containerStatus.Labels[containerLabelK8sPodUID]; ok {
-		containerExtendedData.PodUID = podUID
+		containerData.PodUID = podUID
 	}
 
-	// Parse the extra info and fill the extended data.
-	err := parseExtraInfo(extraInfo, &containerExtendedData)
+	// Parse the extra info and fill the data.
+	containerExtraInfo, err := parseExtraInfo(extraInfo)
 	if err != nil {
 		return nil, err
 	}
+	containerData.ExtraInfo = containerExtraInfo
 
-	return &containerExtendedData, nil
+	return &containerData, nil
 }
 
 // parseExtraInfo parses the extra information returned by ContainerStatus()
@@ -204,7 +173,7 @@ func parseContainerExtendedData(runtimeName string, containerStatus *pb.Containe
 // cri-o v1.18.0: https://github.com/cri-o/cri-o/commit/be8e876cdabec4e055820502fed227aa44971ddc
 // containerd v1.6.0-beta.1: https://github.com/containerd/containerd/commit/85b943eb47bc7abe53b9f9e3d953566ed0f65e6c
 // NOTE: CRI-O does not have runtime spec prior to 1.18.0
-func parseExtraInfo(extraInfo map[string]string, containerExtendedData *runtimeclient.ContainerExtendedData) error {
+func parseExtraInfo(extraInfo map[string]string) (*runtimeclient.ContainerExtraInfo, error) {
 	// Define the info content (only required fields).
 	type RuntimeSpecContent struct {
 		Mounts []struct {
@@ -221,8 +190,9 @@ func parseExtraInfo(extraInfo map[string]string, containerExtendedData *runtimec
 	}
 
 	// Set invalid value to PID.
+	containerExtraInfo := runtimeclient.ContainerExtraInfo{}
 	pid := -1
-	containerExtendedData.Pid = pid
+	containerExtraInfo.Pid = pid
 
 	// Get the extra info from the map.
 	var runtimeSpec *RuntimeSpecContent
@@ -233,7 +203,7 @@ func parseExtraInfo(extraInfo map[string]string, containerExtendedData *runtimec
 		var infoContent InfoContent
 		err := json.Unmarshal([]byte(info), &infoContent)
 		if err != nil {
-			return fmt.Errorf("failed extracting pid from container status reply: %w", err)
+			return nil, fmt.Errorf("failed extracting pid from container status reply: %w", err)
 		}
 
 		// Set the PID value.
@@ -247,49 +217,49 @@ func parseExtraInfo(extraInfo map[string]string, containerExtendedData *runtimec
 		// Extract the PID.
 		pidStr, ok := extraInfo["pid"]
 		if !ok {
-			return fmt.Errorf("container status reply from runtime doesn't contain pid")
+			return nil, fmt.Errorf("container status reply from runtime doesn't contain pid")
 		}
 		var err error
 		pid, err = strconv.Atoi(pidStr)
 		if err != nil {
-			return fmt.Errorf("failed to parse pid %q: %w", pidStr, err)
+			return nil, fmt.Errorf("failed to parse pid %q: %w", pidStr, err)
 		}
 
-		// Extract the ruuntime spec (may not exist).
+		// Extract the runtime spec (may not exist).
 		runtimeSpecStr, ok := extraInfo["runtimeSpec"]
 		if ok {
 			// Unmarshal the JSON to fields.
 			runtimeSpec = &RuntimeSpecContent{}
 			err := json.Unmarshal([]byte(runtimeSpecStr), runtimeSpec)
 			if err != nil {
-				return fmt.Errorf("failed extracting runtime spec from container status reply: %w", err)
+				return nil, fmt.Errorf("failed extracting runtime spec from container status reply: %w", err)
 			}
 		}
 	}
 
 	// Validate extracted fields.
 	if pid == 0 {
-		return fmt.Errorf("got zero pid")
+		return nil, fmt.Errorf("got zero pid")
 	}
 
 	// Set the PID value.
-	containerExtendedData.Pid = pid
+	containerExtraInfo.Pid = pid
 
 	// Copy the runtime spec fields.
 	if runtimeSpec != nil {
 		if runtimeSpec.Linux != nil {
-			containerExtendedData.CgroupsPath = runtimeSpec.Linux.CgroupsPath
+			containerExtraInfo.CgroupsPath = runtimeSpec.Linux.CgroupsPath
 		}
-		containerExtendedData.Mounts = []runtimeclient.ContainerMountData{}
+		containerExtraInfo.Mounts = []runtimeclient.ContainerMountData{}
 		for _, specMount := range runtimeSpec.Mounts {
-			containerExtendedData.Mounts = append(containerExtendedData.Mounts, runtimeclient.ContainerMountData{
+			containerExtraInfo.Mounts = append(containerExtraInfo.Mounts, runtimeclient.ContainerMountData{
 				Destination: specMount.Destination,
 				Source:      specMount.Source,
 			})
 		}
 	}
 
-	return nil
+	return &containerExtraInfo, nil
 }
 
 // Convert the state from container status to state of runtime client.
